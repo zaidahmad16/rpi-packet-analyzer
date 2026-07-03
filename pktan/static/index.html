@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pktan</title>
+<style>
+:root {
+  --bg: #0e1116; --panel: #161b22; --line: #262c36; --text: #e6edf3; --dim: #8b949e;
+  --accent: #3fb6a8; --warn: #e3b341; --info: #58a6ff;
+  --mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4; --text: #1f2328; --dim: #656d76;
+          --accent: #1a7f72; --warn: #9a6700; --info: #0969da; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: baseline;
+         padding: 16px 20px; border-bottom: 1px solid var(--line); }
+header h1 { margin: 0; font-size: 18px; letter-spacing: .02em; }
+header .src { color: var(--dim); font-family: var(--mono); }
+#status { margin-left: auto; font-size: 12px; color: var(--dim); }
+#status.live::before { content: "●"; color: var(--accent); margin-right: 6px; }
+#status.down::before { content: "●"; color: var(--warn); margin-right: 6px; }
+main { padding: 16px 20px 40px; display: grid; gap: 16px;
+       grid-template-columns: repeat(12, 1fr); max-width: 1500px; margin: 0 auto; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+        padding: 14px 16px; min-width: 0; }
+.card h2 { margin: 0 0 10px; font-size: 12px; font-weight: 600; text-transform: uppercase;
+           letter-spacing: .08em; color: var(--dim); }
+.kpis { grid-column: span 12; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 16px; }
+.kpi .v { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.kpi .l { color: var(--dim); font-size: 12px; }
+.chart { grid-column: span 12; }
+canvas { width: 100%; height: 160px; display: block; }
+.w4 { grid-column: span 4; } .w6 { grid-column: span 6; } .w8 { grid-column: span 8; }
+.w12 { grid-column: span 12; }
+@media (max-width: 1000px) { .w4, .w6, .w8 { grid-column: span 12; } }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line);
+         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
+th { color: var(--dim); font-weight: 500; font-size: 12px; }
+td.n, th.n { text-align: right; }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+.dim { color: var(--dim); }
+.bar { height: 6px; background: var(--accent); border-radius: 3px; min-width: 2px; }
+.tag { display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 11px;
+       border: 1px solid var(--line); color: var(--dim); }
+.alert { padding: 6px 0; border-bottom: 1px solid var(--line); }
+.alert.warn .k { color: var(--warn); } .alert.info .k { color: var(--info); }
+#live { height: 300px; overflow: auto; font-family: var(--mono); font-size: 12px; margin: 0; }
+#live div { white-space: pre; }
+.empty { color: var(--dim); font-style: italic; }
+.scroll { max-height: 360px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>pktan</h1>
+  <span class="src" id="src">…</span>
+  <span id="status">connecting</span>
+</header>
+<main>
+  <section class="kpis">
+    <div class="card kpi"><div class="v" id="k-bps">–</div><div class="l">throughput (5s)</div></div>
+    <div class="card kpi"><div class="v" id="k-pps">–</div><div class="l">packets / s</div></div>
+    <div class="card kpi"><div class="v" id="k-pkts">–</div><div class="l">packets total</div></div>
+    <div class="card kpi"><div class="v" id="k-bytes">–</div><div class="l">data total</div></div>
+    <div class="card kpi"><div class="v" id="k-dev">–</div><div class="l">devices seen</div></div>
+  </section>
+
+  <section class="card chart">
+    <h2>Bandwidth, last 2 minutes</h2>
+    <canvas id="chart"></canvas>
+  </section>
+
+  <section class="card w4"><h2>Protocols</h2><table id="t-proto"></table></section>
+  <section class="card w8"><h2>Top hosts</h2><div class="scroll"><table id="t-hosts"></table></div></section>
+
+  <section class="card w8"><h2>Devices on the network</h2><div class="scroll"><table id="t-dev"></table></div></section>
+  <section class="card w4"><h2>Alerts</h2><div id="alerts" class="scroll"></div></section>
+
+  <section class="card w6"><h2>Top conversations</h2><div class="scroll"><table id="t-flows"></table></div></section>
+  <section class="card w6"><h2>DNS lookups</h2><div class="scroll"><table id="t-dns"></table></div></section>
+
+  <section class="card w12"><h2>Live packets</h2><pre id="live"></pre></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function bytes(n) { const u=["B","KB","MB","GB","TB"]; let i=0; while (n>=1024 && i<4) { n/=1024; i++; }
+  return (i ? n.toFixed(1) : n.toFixed(0)) + " " + u[i]; }
+function bits(n) { const u=["bit/s","kbit/s","Mbit/s","Gbit/s"]; let i=0; while (n>=1000 && i<3) { n/=1000; i++; }
+  return (i ? n.toFixed(1) : n.toFixed(0)) + " " + u[i]; }
+function ago(ts, now) { const s = Math.max(0, now - ts); return s < 60 ? Math.round(s)+"s" :
+  s < 3600 ? Math.round(s/60)+"m" : Math.round(s/3600)+"h"; }
+const time = ts => new Date(ts*1000).toLocaleTimeString();
+
+function table(el, head, rows, empty) {
+  if (!rows.length) { el.innerHTML = `<tr><td class="empty">${empty}</td></tr>`; return; }
+  el.innerHTML = "<tr>" + head.map(h => `<th class="${h.endsWith("#") ? "n" : ""}">${h.replace("#","")}</th>`).join("") +
+    "</tr>" + rows.map(r => "<tr>" + r.map((c, i) => `<td class="${head[i].endsWith("#") ? "n" : ""}">${c}</td>`).join("") + "</tr>").join("");
+}
+function host(ip, name) { return `<span class="mono">${esc(ip)}</span>` + (name ? ` <span class="dim">${esc(name)}</span>` : ""); }
+
+function drawChart(hist) {
+  const c = $("chart"), dpr = devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  c.width = w*dpr; c.height = h*dpr;
+  const g = c.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0,0,w,h);
+  const css = getComputedStyle(document.documentElement);
+  const accent = css.getPropertyValue("--accent").trim(), dim = css.getPropertyValue("--dim").trim(),
+        line = css.getPropertyValue("--line").trim();
+  if (hist.length < 2) { g.fillStyle = dim; g.font = "12px system-ui"; g.fillText("waiting for traffic…", 8, 20); return; }
+  const pad = {l: 70, r: 8, t: 8, b: 18}, W = w-pad.l-pad.r, H = h-pad.t-pad.b;
+  const vals = hist.map(x => x.b*8), max = Math.max(...vals, 1000);
+  g.strokeStyle = line; g.fillStyle = dim; g.font = "11px system-ui"; g.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) {
+    const y = pad.t + H - H*i/3; g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w-pad.r, y); g.stroke();
+    g.fillText(bits(max*i/3), 4, y+4);
+  }
+  const x = i => pad.l + W*i/(vals.length-1), y = v => pad.t + H - H*v/max;
+  g.beginPath(); vals.forEach((v,i) => i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v)));
+  g.strokeStyle = accent; g.lineWidth = 2; g.stroke();
+  g.lineTo(x(vals.length-1), pad.t+H); g.lineTo(x(0), pad.t+H); g.closePath();
+  g.globalAlpha = .15; g.fillStyle = accent; g.fill(); g.globalAlpha = 1;
+  g.fillStyle = dim; g.fillText(time(hist[0].t), pad.l, h-3);
+  const lt = time(hist[hist.length-1].t); g.fillText(lt, w-pad.r-g.measureText(lt).width, h-3);
+}
+
+const liveLines = [];
+function render(s) {
+  $("src").textContent = s.source + (s.finished ? " (file finished)" : "");
+  $("k-bps").textContent = bits(s.bps); $("k-pps").textContent = Math.round(s.pps);
+  $("k-pkts").textContent = s.packets.toLocaleString(); $("k-bytes").textContent = bytes(s.bytes);
+  $("k-dev").textContent = s.devices.length;
+  drawChart(s.history);
+
+  const total = Math.max(1, s.packets);
+  table($("t-proto"), ["Protocol","Packets#","Data#",""], s.protocols.map(p => [esc(p.name),
+    p.packets.toLocaleString(), bytes(p.bytes),
+    `<div class="bar" style="width:${Math.max(2, 80*p.packets/total)}px"></div>`]), "no packets yet");
+  table($("t-hosts"), ["Host","Sent#","Received#","Pkts#","Seen#"], s.hosts.map(h => [
+    host(h.ip, h.name || h.vendor) + (h.local ? ' <span class="tag">LAN</span>' : ""),
+    bytes(h.tx), bytes(h.rx), h.packets.toLocaleString(), ago(h.last, s.now)]), "no hosts yet");
+  table($("t-dev"), ["MAC","Vendor","Name","IPs","Data#","Seen#"], s.devices.map(d => [
+    `<span class="mono">${esc(d.mac)}</span>`, esc(d.vendor || "–"), esc(d.name || "–"),
+    `<span class="mono">${esc(d.ips.join(", ") || "–")}</span>`, bytes(d.bytes), ago(d.last, s.now)]),
+    "no devices yet");
+  table($("t-flows"), ["Between","And","App","Data#"], s.flows.map(f => [
+    host(f.a, f.a_name), host(f.b, f.b_name), esc(f.label), bytes(f.bytes)]), "no conversations yet");
+  table($("t-dns"), ["Time","Client","Type","Name"], s.dns.map(d => [
+    time(d.ts), `<span class="mono">${esc(d.client)}</span>`, esc(d.type), esc(d.query)]),
+    "no DNS queries seen (try: open a website)");
+  $("alerts").innerHTML = s.alerts.length ? s.alerts.map(a =>
+    `<div class="alert ${a.level}"><span class="k">${esc(a.kind)}</span> <span class="dim">${time(a.ts)}</span><br>${esc(a.msg)}</div>`).join("")
+    : '<div class="empty">nothing suspicious so far</div>';
+
+  const live = $("live"), atBottom = live.scrollHeight - live.scrollTop - live.clientHeight < 20;
+  for (const r of s.recent) liveLines.push(`<div><span class="dim">${time(r.ts)}</span> ${esc(r.text)}</div>`);
+  liveLines.splice(0, Math.max(0, liveLines.length - 300));
+  live.innerHTML = liveLines.join("");
+  if (atBottom) live.scrollTop = live.scrollHeight;
+  if (s.error) { $("status").textContent = "capture error: " + s.error; $("status").className = "down"; }
+}
+
+function connect() {
+  const es = new EventSource("/events");
+  es.onopen = () => { $("status").textContent = "live"; $("status").className = "live"; };
+  es.onmessage = e => render(JSON.parse(e.data));
+  es.onerror = () => { $("status").textContent = "reconnecting…"; $("status").className = "down"; };
+}
+connect();
+</script>
+</body>
+</html>
