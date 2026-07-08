@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 
 from .capture import list_interfaces
+from .metrics import render as render_metrics
 
 
 def make_handler(engine, source: str):
@@ -40,6 +41,9 @@ def make_handler(engine, source: str):
                 snap["source"] = source
                 snap["error"] = str(engine.error) if engine.error else None
                 self._json(snap)
+            elif path == "/metrics":
+                self._send(render_metrics(engine.stats, source).encode(),
+                           "text/plain; version=0.0.4; charset=utf-8")
             elif path == "/api/interfaces":
                 self._json(list_interfaces())
             elif path == "/events":

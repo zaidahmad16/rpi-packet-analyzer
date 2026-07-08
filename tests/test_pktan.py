@@ -149,6 +149,16 @@ class StatsTests(unittest.TestCase):
         self.assertEqual([a["kind"] for a in alerts], ["new-device"])
         self.assertIn("3c:22:fb:00:00:01 (Apple) at 192.168.1.23", alerts[0]["msg"])
 
+    def test_plaintext_alert_only_when_accepted(self):
+        s = Stats()
+        cli, srv = "192.168.1.23", "192.168.1.50"
+        s.add(decode(eth(MAC_PI, MAC_PHONE, 0x0800, ipv4(cli, srv, 6, tcp(40000, 23, "S")))))
+        s.add(decode(eth(MAC_PI, MAC_PHONE, 0x0800, ipv4(srv, cli, 6, tcp(21, 40001, "RA")))))
+        self.assertEqual(s.snapshot()["alerts"], [])        # attempt + refused: no alert
+        s.add(decode(eth(MAC_PHONE, MAC_PI, 0x0800, ipv4(srv, cli, 6, tcp(23, 40000, "SA")))))
+        (a,) = s.snapshot()["alerts"]
+        self.assertEqual(a["msg"], "Unencrypted TELNET connection 192.168.1.23 -> 192.168.1.50")
+
     def test_arp_change_alert(self):
         s = Stats()
         s.add(decode(eth(BC, MAC_ROUTER, 0x0806, arp(2, MAC_ROUTER, "192.168.1.1", MAC_PI, "192.168.1.50"))))

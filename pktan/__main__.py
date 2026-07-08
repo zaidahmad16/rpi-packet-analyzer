@@ -1,4 +1,4 @@
-"""pktan command line: list | sniff | top | web."""
+"""pktan command line: list | sniff | top | web | aws-check."""
 from __future__ import annotations
 
 import argparse
@@ -29,6 +29,13 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--max-mb", type=float, default=50,
                        help="cap for --write; rotates to FILE.1 when full (default 50)")
         p.add_argument("--no-promisc", action="store_true", help="don't enable promiscuous mode")
+        aws = p.add_argument_group("AWS (credentials from env vars or ~/.aws/credentials)")
+        aws.add_argument("--sns-topic", metavar="ARN", help="send alerts to this SNS topic")
+        aws.add_argument("--alerts-per-hour", type=int, default=20,
+                         help="cap on SNS messages per hour (default 20)")
+        aws.add_argument("--s3-bucket", metavar="NAME",
+                         help="with --write: upload each full pcap to this bucket, then delete it locally")
+        aws.add_argument("--s3-prefix", default="pktan/", help="key prefix in the bucket (default pktan/)")
         return p
 
     sn = common(sub.add_parser("sniff", help="print packets one per line"))
@@ -46,7 +53,15 @@ def main(argv: list[str] | None = None) -> int:
     wb.add_argument("--include-self", action="store_true",
                     help="don't hide the dashboard's own HTTP traffic")
 
+    ck = sub.add_parser("aws-check", help="send a test alert and upload a test file to check AWS setup")
+    ck.add_argument("--sns-topic", metavar="ARN")
+    ck.add_argument("--s3-bucket", metavar="NAME")
+    ck.add_argument("--s3-prefix", default="pktan/")
+
     args = ap.parse_args(argv)
+
+    if args.cmd == "aws-check":
+        return _aws_check(args)
 
     if args.cmd == "list":
         default = default_interface()
@@ -75,6 +90,22 @@ def main(argv: list[str] | None = None) -> int:
         args.iface = args.iface or default_interface() or "any"
         source = args.iface
 
+    if args.s3_bucket and not args.write:
+        print("pktan: --s3-bucket needs --write FILE (the capture that gets uploaded)", file=sys.stderr)
+        return 2
+    notifier = archiver = None
+    if args.sns_topic or args.s3_bucket:
+        from .aws import AlertNotifier, AwsError, S3Archiver, load_credentials
+        try:
+            load_credentials()          # fail now, not on the first alert
+        except AwsError as e:
+            print(f"pktan: {e}", file=sys.stderr)
+            return 2
+        if args.sns_topic:
+            notifier = AlertNotifier(args.sns_topic, args.alerts_per_hour, source)
+        if args.s3_bucket:
+            archiver = S3Archiver(args.s3_bucket, args.s3_prefix, source)
+
     printer = None
     if args.cmd == "sniff":
         from .tui import LinePrinter
@@ -84,7 +115,8 @@ def main(argv: list[str] | None = None) -> int:
     engine = Engine(iface=args.iface, read=args.read, flt=flt, write=args.write,
                     max_mb=args.max_mb, count=getattr(args, "count", 0),
                     realtime=getattr(args, "realtime", False),
-                    promisc=not args.no_promisc, on_packet=printer).start()
+                    promisc=not args.no_promisc, on_packet=printer,
+                    notifier=notifier, archiver=archiver).start()
     signal.signal(signal.SIGTERM, _raise_interrupt)   # systemd stop -> clean shutdown
 
     try:
@@ -107,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         engine.stop()
-        engine.join(2)
+        engine.join(120 if archiver else 2)   # let the last upload finish
 
     if engine.error:
         if isinstance(engine.error, (CaptureError, ValueError)):
@@ -118,6 +150,48 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sniff" and args.stats:
         _print_summary(engine.stats.snapshot())
     return 0
+
+
+def _aws_check(args) -> int:
+    """Prove the AWS setup works end to end, one step at a time."""
+    import tempfile
+
+    from .aws import AwsError, default_region, load_credentials, s3_key, s3_put_file, sns_publish
+    if not (args.sns_topic or args.s3_bucket):
+        print("pktan: give --sns-topic ARN and/or --s3-bucket NAME to check", file=sys.stderr)
+        return 2
+    ok = True
+    try:
+        creds = load_credentials()
+        print(f"credentials   ok   (access key {creds.access_key[:4]}…{creds.access_key[-4:]})")
+    except AwsError as e:
+        print(f"credentials   FAIL {e}")
+        return 1
+    if args.sns_topic:
+        try:
+            mid = sns_publish(args.sns_topic, "pktan: test alert",
+                              "This is a test from `pktan aws-check`. "
+                              "If you got it, alerts are set up.", creds)
+            print(f"sns publish   ok   (message {mid})")
+        except AwsError as e:
+            ok = False
+            print(f"sns publish   FAIL {e}")
+    if args.s3_bucket:
+        with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False) as f:
+            from .pcap import PcapWriter
+            path = f.name
+        PcapWriter(path).close()                      # a valid, empty capture
+        key = s3_key(args.s3_prefix, "aws-check")
+        try:
+            region = default_region()
+            s3_put_file(args.s3_bucket, key, path, region, creds)
+            print(f"s3 upload     ok   (s3://{args.s3_bucket}/{key}, region {region})")
+        except AwsError as e:
+            ok = False
+            print(f"s3 upload     FAIL {e}")
+        finally:
+            os.remove(path)
+    return 0 if ok else 1
 
 
 def _raise_interrupt(*_):

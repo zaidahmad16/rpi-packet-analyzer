@@ -20,7 +20,9 @@ $ sudo python3 -m pktan sniff -f "dns or (tcp port 443 and not port 22)"
 - **Filters** in a tcpdump-like syntax: `tcp port 443`, `dns or arp`, `host 10.0.0.5 and not port 22`, `net 192.168.1.0/24`, `src port 1000-2000`, `ip6`.
 - **pcap in and out:** analyse captures from Wireshark/tcpdump (`--read`), or save traffic (`--write`) with a hard size cap.
 - **Bounded memory:** every table is pruned, so it can run for weeks on a Pi.
-- **Tested:** 26 unit tests built from hand-made packets, so no capture privileges are needed to run them.
+- **Prometheus metrics** at `/metrics`, plus a ready-made **Grafana** dashboard, deployed to k3s next to pktan.
+- **AWS:** alerts go to your phone or email through **SNS**, and saved captures upload to **S3**. AWS requests are signed with a hand-written Signature Version 4, so there's still nothing to install.
+- **Tested:** 42 unit tests built from hand-made packets (and AWS's own SigV4 test vectors), so no capture privileges or AWS account are needed to run them.
 
 ## Quick start (on the Pi)
 
@@ -52,7 +54,7 @@ python3 -m pktan top --read capture.pcap
 ```bash
 ./install-pi.sh pi@raspberrypi.local --service
 ```
-This copies the code to `/opt/pktan` and installs `systemd/pktan.service`. The service runs as `nobody` with only the raw-capture capabilities and a 200 MB memory cap.
+This copies the code to `/opt/pktan` and installs `systemd/pktan.service`. The service runs as its own throwaway system user (`DynamicUser`) with only the raw-capture capabilities and a 200 MB memory cap. Extra options (interface, AWS) go in `/etc/pktan.env`; see the AWS section below.
 
 ## Commands
 
@@ -61,11 +63,52 @@ This copies the code to `/opt/pktan` and installs `systemd/pktan.service`. The s
 | `pktan list` | List interfaces and show which one is the default |
 | `pktan sniff [-c N] [--stats]` | Print packets as they arrive; `--stats` adds a summary at the end |
 | `pktan top [--realtime]` | Full-screen terminal dashboard |
-| `pktan web [--port 8080] [--bind ADDR]` | Web dashboard (JSON at `/api/stats`, live stream at `/events`) |
+| `pktan web [--port 8080] [--bind ADDR]` | Web dashboard (JSON at `/api/stats`, live stream at `/events`, Prometheus at `/metrics`) |
+| `pktan aws-check [--sns-topic ARN] [--s3-bucket NAME]` | Send a test alert and upload a test file to prove the AWS setup works |
 
-Shared options: `-i IFACE` (or `any`), `-r FILE.pcap`, `-f FILTER`, `-w FILE.pcap --max-mb 50`, `--no-promisc`.
+Shared options: `-i IFACE` (or `any`), `-r FILE.pcap`, `-f FILTER`, `-w FILE.pcap --max-mb 50`, `--no-promisc`, and the AWS options `--sns-topic ARN`, `--alerts-per-hour N`, `--s3-bucket NAME`, `--s3-prefix P`.
 
 `web` hides its own dashboard traffic automatically (`--include-self` turns that off).
+
+## Prometheus and Grafana
+
+`pktan web` serves Prometheus metrics at `/metrics`: packet and byte counters (total and per protocol), DNS queries, alerts by kind, and gauges for devices, LAN hosts and conversations. Protocol labels are capped at 30 so an odd mix can't blow up Prometheus.
+
+`deploy/k8s/` runs Prometheus and Grafana on the Pi's k3s, next to pktan:
+
+```bash
+sudo ./deploy/k8s/install.sh          # prints the Grafana admin password once
+```
+
+- Grafana at **http://raspberrypi.local:30300** opens on the provisioned *pktan network overview* dashboard. Anyone on the LAN can view it; editing needs the admin login.
+- Prometheus keeps 30 days of data, capped at 1.5 GB.
+- Prometheus uses host networking and scrapes `127.0.0.1:8080`, so pktan has to be running as the service (see *Run on boot*).
+- `sudo ./deploy/k8s/install.sh --remove` deletes all of it.
+
+## AWS: alerts by SNS, captures to S3
+
+pktan can push alerts (new device, ARP change, port scan, plaintext login) to an **SNS topic**, so they reach your phone or email. With `--write`, it can also upload each full capture file to **S3** and then delete it locally, so the SD card never fills.
+
+Setup in the AWS console:
+
+1. **SNS:** create a Standard topic called `pktan-alerts`, add a subscription (email or SMS), and confirm it.
+2. **S3:** create a bucket (private, all public access blocked). Optionally add a lifecycle rule that expires `pktan/` objects after 30 days.
+3. **IAM:** create a user with no console access, attach an inline policy from [`deploy/aws/iam-policy.json`](deploy/aws/iam-policy.json) (fill in region, account ID and bucket), and create an access key for it. The policy only allows publishing to that one topic and uploading under `pktan/` in that one bucket.
+4. On the Pi, put the settings in `/etc/pktan.env` and lock it down (`sudo chmod 600 /etc/pktan.env`):
+   ```
+   AWS_ACCESS_KEY_ID=AKIA...
+   AWS_SECRET_ACCESS_KEY=...
+   AWS_REGION=ca-central-1
+   PKTAN_ARGS="--sns-topic arn:aws:sns:ca-central-1:123456789012:pktan-alerts -w /var/lib/pktan/capture.pcap --max-mb 50 --s3-bucket YOUR-BUCKET"
+   ```
+5. Check it end to end, then restart the service:
+   ```bash
+   sudo bash -c 'set -a; . /etc/pktan.env; cd /opt/pktan && python3 -m pktan aws-check \
+     --sns-topic "arn:aws:sns:...:pktan-alerts" --s3-bucket YOUR-BUCKET'
+   sudo systemctl restart pktan
+   ```
+
+Alerts are capped at 20 per hour (`--alerts-per-hour`); the next message says how many were held back. SNS and S3 calls run on background threads, so a slow or missing connection never stalls capture. Failed uploads are retried at the next rotation, with at most 3 files kept waiting. On a home network this stays within the AWS free tier.
 
 ## What the Pi can actually see
 
@@ -89,8 +132,13 @@ pktan/
   stats.py     rolling counters, device/name tracking, alerts
   pcap.py      pcap reader/writer (size-capped)
   tui.py       sniff + top terminal views
-  web.py       HTTP server, JSON API, Server-Sent Events
+  web.py       HTTP server, JSON API, Server-Sent Events, /metrics
+  metrics.py   Prometheus text exposition
+  aws.py       SigV4 signing, SNS alerts, S3 capture archiving
   static/index.html  dashboard (vanilla JS, no CDN, works offline)
+deploy/k8s/    Prometheus + Grafana manifests and install script for k3s
+deploy/grafana/  the provisioned dashboard
+deploy/aws/    least-privilege IAM policy
 tests/         python3 -m unittest discover -s tests
 ```
 

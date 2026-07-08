@@ -10,6 +10,7 @@ import re
 import threading
 import time
 from collections import Counter, deque
+from typing import Callable
 
 from .decode import WELL_KNOWN_PORTS, Packet
 
@@ -136,8 +137,10 @@ def _is_unicast_ip(ip: str | None) -> bool:
 
 
 class Stats:
-    def __init__(self, recent: int = 300, dns_log: int = 300, alerts: int = 200):
+    def __init__(self, recent: int = 300, dns_log: int = 300, alerts: int = 200,
+                 on_alert: Callable[[dict], None] | None = None):
         self.lock = threading.Lock()
+        self.on_alert = on_alert                  # called (under the lock) for every alert
         self.started = time.time()
         self.packets = 0
         self.bytes = 0
@@ -153,6 +156,8 @@ class Stats:
         self.recent: deque = deque(maxlen=recent)
         self.dns_log: deque = deque(maxlen=dns_log)
         self.alerts: deque = deque(maxlen=alerts)
+        self.alert_counts: Counter = Counter()    # kind -> total, for /metrics
+        self.dns_queries = 0
         self._arp: dict[str, str] = {}            # ip -> mac
         self._scan: dict[str, deque] = {}         # src ip -> deque[(ts, dport)]
         self._scan_alerted: dict[str, float] = {}
@@ -267,6 +272,7 @@ class Stats:
             for name, ip in p.dns_answers:
                 self._name(ip, name)   # includes mDNS ("Zaids-MacBook.local")
         if p.dns_query and not p.dns_answers and p.app == "DNS" and p.info.startswith("query"):
+            self.dns_queries += 1
             self.dns_log.append({"ts": p.ts, "client": p.src, "query": p.dns_query,
                                  "type": p.info.split()[1] if len(p.info.split()) > 1 else ""})
         if p.hostname and p.src_mac:
@@ -311,13 +317,18 @@ class Stats:
                             f"{SCAN_WINDOW:.0f}s (port scan?)")
             if len(self._scan) > MAX_HOSTS:
                 self._scan.pop(next(iter(self._scan)))
-        # Plaintext protocols that leak credentials
-        if p.app in ("TELNET", "FTP") and p.tcp_flags == "S":
+        # Plaintext protocols that leak credentials. Alert on the server's SYN-ACK,
+        # i.e. a connection that was accepted, so scans of port 21/23 don't count.
+        if p.app in ("TELNET", "FTP") and p.tcp_flags == "SA" and p.sport in (21, 23):
             self._alert(p.ts, "warn", "plaintext",
-                        f"Unencrypted {p.app} connection {p.src} -> {p.dst}")
+                        f"Unencrypted {p.app} connection {p.dst} -> {p.src}")
 
     def _alert(self, ts: float, level: str, kind: str, msg: str) -> None:
-        self.alerts.append({"ts": ts, "level": level, "kind": kind, "msg": msg})
+        alert = {"ts": ts, "level": level, "kind": kind, "msg": msg}
+        self.alerts.append(alert)
+        self.alert_counts[kind] += 1
+        if self.on_alert:
+            self.on_alert(alert)
 
     @staticmethod
     def _prune(d: dict, n: int) -> None:

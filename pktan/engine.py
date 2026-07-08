@@ -15,12 +15,15 @@ class Engine:
                  flt: Callable[[Packet], bool] = lambda p: True,
                  write: str | None = None, max_mb: float = 50, count: int = 0,
                  realtime: bool = False, promisc: bool = True,
-                 on_packet: Callable[[Packet], None] | None = None):
+                 on_packet: Callable[[Packet], None] | None = None,
+                 notifier=None, archiver=None):
         self.iface, self.read, self.flt = iface, read, flt
         self.count, self.realtime, self.promisc = count, realtime, promisc
         self.on_packet = on_packet
-        self.stats = Stats()
-        self.writer = PcapWriter(write, int(max_mb * 1024 * 1024)) if write else None
+        self.notifier, self.archiver = notifier, archiver
+        self.stats = Stats(on_alert=notifier.notify if notifier else None)
+        self.writer = PcapWriter(write, int(max_mb * 1024 * 1024),
+                                 on_rotate=archiver.rotated if archiver else None) if write else None
         self.error: BaseException | None = None
         self.done = threading.Event()
         self._stop = threading.Event()
@@ -61,5 +64,13 @@ class Engine:
             self.error = e
         finally:
             if self.writer:
-                self.writer.close()
+                if self.archiver:
+                    # upload the last file here, synchronously, before exiting
+                    self.writer.on_rotate = self.archiver.queue
+                    self.writer.finish()
+                    self.archiver.drain()
+                else:
+                    self.writer.close()
+            if self.notifier:
+                self.notifier.close()
             self.done.set()

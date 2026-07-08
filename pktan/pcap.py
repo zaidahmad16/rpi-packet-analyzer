@@ -1,13 +1,15 @@
 """Classic libpcap file reader/writer (no pcapng).
 
 The writer has a hard size cap: once the file would exceed `max_bytes` it
-rotates to a single `.1` backup, so disk use never exceeds ~2x the cap.
+rotates to a single `.1` backup, so disk use never exceeds ~2x the cap (or,
+with on_rotate, hands the full file off, e.g. to the S3 archiver).
 """
 from __future__ import annotations
 
 import os
 import struct
-from typing import BinaryIO, Iterator
+import time
+from typing import BinaryIO, Callable, Iterator
 
 from .decode import LINK_ETHERNET, LINK_RAW
 
@@ -58,10 +60,15 @@ def read_pcap(path: str) -> Iterator[tuple[float, bytes, int, int]]:
 class PcapWriter:
     """Writes Ethernet-linktype pcap; raw-IP frames get a synthetic Ethernet header."""
 
-    def __init__(self, path: str, max_bytes: int = 50 * 1024 * 1024, snaplen: int = 65535):
+    def __init__(self, path: str, max_bytes: int = 50 * 1024 * 1024, snaplen: int = 65535,
+                 on_rotate: Callable[[str], None] | None = None):
+        """on_rotate: if set, each full file is renamed to a unique timestamped
+        name and handed to this callback (e.g. to upload it) instead of
+        becoming PATH.1."""
         self.path = path
         self.max_bytes = max_bytes
         self.snaplen = snaplen
+        self.on_rotate = on_rotate
         self._f: BinaryIO | None = None
         self._size = 0
         self._open()
@@ -90,8 +97,28 @@ class PcapWriter:
 
     def _rotate(self) -> None:
         self.close()
-        os.replace(self.path, self.path + ".1")
+        if self.on_rotate:
+            self._hand_off()
+        else:
+            os.replace(self.path, self.path + ".1")
         self._open()
+
+    def _hand_off(self) -> None:
+        done = f"{self.path}.{time.strftime('%Y%m%dT%H%M%S')}"
+        n = 1
+        while os.path.exists(done):
+            done = f"{self.path}.{time.strftime('%Y%m%dT%H%M%S')}-{n}"
+            n += 1
+        os.replace(self.path, done)
+        assert self.on_rotate is not None
+        self.on_rotate(done)
+
+    def finish(self) -> None:
+        """Close for good; with on_rotate, hand off the last file if it has packets."""
+        had_packets = self._size > 24
+        self.close()
+        if self.on_rotate and had_packets and os.path.exists(self.path):
+            self._hand_off()
 
     def flush(self) -> None:
         if self._f:
