@@ -8,7 +8,7 @@
   "timezone": "browser",
   "refresh": "30s",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "graphTooltip": 1,
   "time": {
@@ -44,7 +44,19 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "bps"
+          "unit": "bps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
         },
         "overrides": []
       },
@@ -89,7 +101,19 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "none"
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
         },
         "overrides": []
       },
@@ -134,7 +158,19 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "none"
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
         },
         "overrides": []
       },
@@ -173,7 +209,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(pktan_alerts_total[24h]))",
+          "expr": "round(sum(increase(pktan_alerts_total[24h])))",
           "legendFormat": ""
         }
       ],
@@ -192,7 +228,8 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "decimals": 0
         },
         "overrides": []
       },
@@ -362,13 +399,27 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "topk(10, sum by (protocol) (increase(pktan_protocol_bytes_total[1h])))",
-          "legendFormat": "{{protocol}}"
+          "expr": "sort_desc(topk(10, sum by (protocol) (increase(pktan_protocol_bytes_total[1h]))) > 0)",
+          "legendFormat": "{{protocol}}",
+          "instant": true,
+          "range": false
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "bytes"
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
         },
         "overrides": []
       },
@@ -381,14 +432,15 @@
           ],
           "fields": "",
           "values": false
-        }
+        },
+        "showUnfilled": true
       }
     },
     {
       "id": 9,
-      "type": "timeseries",
-      "title": "Alerts by kind",
-      "description": "Alerts raised per 10 minutes.",
+      "type": "bargauge",
+      "title": "Alerts by kind (24h)",
+      "description": "How many of each alert pktan raised in the last day.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -406,26 +458,48 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (kind) (increase(pktan_alerts_total[10m]))",
-          "legendFormat": "{{kind}}"
+          "expr": "round(sum by (kind) (increase(pktan_alerts_total[24h])))",
+          "legendFormat": "{{kind}}",
+          "instant": true,
+          "range": false
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "none",
-          "custom": {
-            "drawStyle": "bars",
-            "fillOpacity": 70,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal",
-              "group": "A"
-            }
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
           }
         },
         "overrides": []
       },
-      "options": {}
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
     },
     {
       "id": 10,
