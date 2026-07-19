@@ -29,6 +29,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--max-mb", type=float, default=50,
                        help="cap for --write; rotates to FILE.1 when full (default 50)")
         p.add_argument("--no-promisc", action="store_true", help="don't enable promiscuous mode")
+        p.add_argument("--state-dir", metavar="DIR",
+                       help="remember known devices here across restarts "
+                            "(default: $STATE_DIRECTORY, which systemd sets)")
         aws = p.add_argument_group("AWS (credentials from env vars or ~/.aws/credentials)")
         aws.add_argument("--sns-topic", metavar="ARN", help="send alerts to this SNS topic")
         aws.add_argument("--alerts-per-hour", type=int, default=20,
@@ -106,6 +109,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.s3_bucket:
             archiver = S3Archiver(args.s3_bucket, args.s3_prefix, source)
 
+    known = None
+    state_dir = args.state_dir or os.environ.get("STATE_DIRECTORY", "").split(":")[0]
+    if state_dir and not args.read:
+        from .stats import KnownDevices
+        own = [i["mac"] for i in list_interfaces() if i["mac"] and i["mac"] != "00:00:00:00:00:00"]
+        known = KnownDevices(os.path.join(state_dir, "known-devices.json"), own)
+
     printer = None
     if args.cmd == "sniff":
         from .tui import LinePrinter
@@ -116,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
                     max_mb=args.max_mb, count=getattr(args, "count", 0),
                     realtime=getattr(args, "realtime", False),
                     promisc=not args.no_promisc, on_packet=printer,
-                    notifier=notifier, archiver=archiver).start()
+                    notifier=notifier, archiver=archiver, known=known).start()
     signal.signal(signal.SIGTERM, _raise_interrupt)   # systemd stop -> clean shutdown
 
     try:

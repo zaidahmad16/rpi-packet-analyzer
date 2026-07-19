@@ -16,13 +16,13 @@ $ sudo python3 -m pktan sniff -f "dns or (tcp port 443 and not port 22)"
 - **Live capture** with a raw `AF_PACKET` socket. Works on Ethernet, Wi-Fi, VLAN-tagged and tunnel interfaces (Tailscale/WireGuard), or on `any`.
 - **Decoders:** Ethernet, 802.1Q, ARP, IPv4, IPv6 (with extension headers), TCP, UDP, ICMP/ICMPv6, DNS/mDNS/LLMNR, DHCP (including client hostnames), TLS SNI, HTTP Host, and QUIC detection.
 - **Statistics:** throughput over time, protocol mix, top hosts, top conversations, top ports, DNS lookups, and the devices on the LAN, each with vendor (from the MAC prefix) plus hostnames learned from DNS, mDNS, DHCP and SNI.
-- **Alerts:** new device joined, an IP address claimed by a different MAC (ARP spoofing or IP conflict), port scans, and unencrypted Telnet/FTP.
+- **Alerts:** new device joined (remembered across restarts, so a reboot doesn't re-announce every quiet device), an IP address claimed by a different MAC (ARP spoofing or IP conflict), port scans, and unencrypted Telnet/FTP.
 - **Filters** in a tcpdump-like syntax: `tcp port 443`, `dns or arp`, `host 10.0.0.5 and not port 22`, `net 192.168.1.0/24`, `src port 1000-2000`, `ip6`.
 - **pcap in and out:** analyse captures from Wireshark/tcpdump (`--read`), or save traffic (`--write`) with a hard size cap.
 - **Bounded memory:** every table is pruned, so it can run for weeks on a Pi.
 - **Prometheus metrics** at `/metrics`, plus a ready-made **Grafana** dashboard, deployed to k3s next to pktan.
 - **AWS:** alerts go to your phone or email through **SNS**, and saved captures upload to **S3**. AWS requests are signed with a hand-written Signature Version 4, so there's still nothing to install.
-- **Tested:** 42 unit tests built from hand-made packets (and AWS's own SigV4 test vectors), so no capture privileges or AWS account are needed to run them.
+- **Tested:** 44 unit tests built from hand-made packets (and AWS's own SigV4 test vectors), so no capture privileges or AWS account are needed to run them.
 
 ## Quick start (on the Pi)
 

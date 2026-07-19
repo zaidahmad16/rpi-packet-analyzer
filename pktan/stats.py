@@ -6,11 +6,14 @@ no matter how long the analyzer runs.
 from __future__ import annotations
 
 import ipaddress
+import json
+import os
 import re
+import sys
 import threading
 import time
 from collections import Counter, deque
-from typing import Callable
+from typing import Callable, Iterable
 
 from .decode import WELL_KNOWN_PORTS, Packet
 
@@ -19,7 +22,8 @@ MAX_NAMES = 8000
 HISTORY_SECONDS = 300
 SCAN_WINDOW = 10.0        # seconds
 SCAN_PORTS = 25           # distinct dst ports from one source within the window
-NEW_DEVICE_GRACE = 90.0   # seconds after the first packet before new-device alerts
+NEW_DEVICE_LEARN = 600.0  # with no saved device list, learn this long before new-device alerts
+MAX_KNOWN_DEVICES = 20000
 
 # Small built-in OUI table: just enough to label common home-network devices.
 OUI = {
@@ -136,9 +140,62 @@ def _is_unicast_ip(ip: str | None) -> bool:
     return not (a.is_multicast or a.is_unspecified or ip.endswith(".255"))
 
 
+class KnownDevices:
+    """MAC addresses pktan has ever seen, kept across restarts.
+
+    Without this, every restart forgot the network, and quiet devices (cameras,
+    plugs) that spoke a few minutes later were reported as "new". With a saved
+    list, only a MAC never seen before raises an alert; on a first run with no
+    list yet, pktan learns for NEW_DEVICE_LEARN seconds before alerting.
+    """
+
+    def __init__(self, path: str | None = None, own: Iterable[str] = ()):
+        self.path = path
+        self.first_seen: dict[str, float] = {}
+        self.loaded = False                       # True if a saved list existed
+        self._dirty = False
+        self._saved_at = 0.0
+        if path:
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                self.first_seen = {str(k).lower(): float(v) for k, v in data.get("devices", {}).items()}
+                self.loaded = True
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, AttributeError) as e:
+                print(f"pktan: ignoring unreadable device list {path}: {e}", file=sys.stderr)
+        for mac in own:                           # our own interfaces are never "new"
+            self.first_seen.setdefault(mac.lower(), 0.0)
+
+    def __contains__(self, mac: str) -> bool:
+        return mac in self.first_seen
+
+    def add(self, mac: str, ts: float) -> None:
+        self.first_seen[mac] = ts
+        if len(self.first_seen) > MAX_KNOWN_DEVICES:
+            for old in sorted(self.first_seen, key=self.first_seen.get)[: MAX_KNOWN_DEVICES // 10]:
+                del self.first_seen[old]
+        self._dirty = True
+
+    def save(self, force: bool = False) -> None:
+        """Write atomically; at most every 30 s unless forced."""
+        if not (self.path and self._dirty) or (not force and time.time() - self._saved_at < 30):
+            return
+        tmp = f"{self.path}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"version": 1, "devices": self.first_seen}, f)
+            os.replace(tmp, self.path)
+            self._dirty, self._saved_at = False, time.time()
+        except OSError as e:
+            print(f"pktan: could not save device list {self.path}: {e}", file=sys.stderr)
+
+
 class Stats:
     def __init__(self, recent: int = 300, dns_log: int = 300, alerts: int = 200,
-                 on_alert: Callable[[dict], None] | None = None):
+                 on_alert: Callable[[dict], None] | None = None,
+                 known: KnownDevices | None = None):
         self.lock = threading.Lock()
         self.on_alert = on_alert                  # called (under the lock) for every alert
         self.started = time.time()
@@ -163,6 +220,7 @@ class Stats:
         self._scan_alerted: dict[str, float] = {}
         self._seq = 0
         self._first_ts: float | None = None
+        self.known = known or KnownDevices()
 
     # ------------------------------------------------------------ ingest
     def add(self, p: Packet) -> None:
@@ -240,11 +298,14 @@ class Stats:
             d = self.devices[mac] = {"vendor": vendor_of(mac), "ips": [], "hostname": None,
                                      "first": p.ts, "last": p.ts, "packets": 0, "bytes": 0,
                                      "iface": p.iface}
-            # quiet devices trickle in during the first minute; only alert after that
-            if p.ts - self._first_ts > NEW_DEVICE_GRACE:
-                self._alert(p.ts, "info", "new-device",
-                            f"New device {mac} ({d['vendor'] or 'unknown vendor'})"
-                            + (f" at {ip}" if ip else ""))
+            if mac not in self.known:
+                self.known.add(mac, p.ts)
+                learning = not self.known.loaded and p.ts - self._first_ts < NEW_DEVICE_LEARN
+                if not learning:
+                    self._alert(p.ts, "info", "new-device",
+                                f"New device {mac} ({d['vendor'] or 'unknown vendor'})"
+                                + (f" at {ip}" if ip else ""))
+            self.known.save()
         d["last"] = p.ts
         d["packets"] += 1
         d["bytes"] += p.length

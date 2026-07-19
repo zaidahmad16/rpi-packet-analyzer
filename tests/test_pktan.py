@@ -140,15 +140,41 @@ class StatsTests(unittest.TestCase):
         kinds = [a["kind"] for a in s.snapshot()["alerts"]]
         self.assertEqual(kinds.count("port-scan"), 1)
 
-    def test_new_device_alert_after_grace(self):
-        s = Stats()
-        s.add(decode(eth(MAC_ROUTER, MAC_PI, 0x0800, ipv4("192.168.1.50", "1.1.1.1", 17, udp(1, 53, b""))), ts=100))
-        s.add(decode(eth(MAC_ROUTER, MAC_ROUTER, 0x0800, ipv4("192.168.1.1", "1.1.1.1", 17, udp(1, 53, b""))), ts=150))
-        s.add(decode(eth(MAC_ROUTER, MAC_PHONE, 0x0800, ipv4("192.168.1.23", "1.1.1.1", 17, udp(1, 53, b""))), ts=300))
+    def test_new_device_learning_period(self):
+        s = Stats()                                   # no saved list: learn first
+        frame = lambda mac, ip: eth(MAC_ROUTER, mac, 0x0800, ipv4(ip, "1.1.1.1", 17, udp(1, 53, b"")))
+        s.add(decode(frame(MAC_PI, "192.168.1.50"), ts=100))
+        s.add(decode(frame(MAC_ROUTER, "192.168.1.1"), ts=400))       # quiet device, 5 min in
+        s.add(decode(frame(MAC_PHONE, "192.168.1.23"), ts=800))       # after the 10 min learning
         alerts = s.snapshot()["alerts"]
         self.assertEqual([a["kind"] for a in alerts], ["new-device"])
         self.assertIn("3c:22:fb:00:00:01 (Apple) at 192.168.1.23", alerts[0]["msg"])
 
+    def test_known_devices_survive_restart(self):
+        from pktan.stats import KnownDevices
+        frame = lambda mac, ip: eth(MAC_ROUTER, mac, 0x0800, ipv4(ip, "1.1.1.1", 17, udp(1, 53, b"")))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "known.json")
+            s = Stats(known=KnownDevices(path))
+            s.add(decode(frame(MAC_ROUTER, "192.168.1.1"), ts=100))
+            s.known.save(force=True)
+            # restart: the router is remembered, our own NIC is known, a new phone alerts at once
+            s2 = Stats(known=KnownDevices(path, own=["2C:CF:67:00:00:99"]))
+            s2.add(decode(frame(MAC_ROUTER, "192.168.1.1"), ts=5000))
+            s2.add(decode(frame(MAC_PI, "192.168.1.50"), ts=5001))
+            s2.add(decode(frame(MAC_PHONE, "192.168.1.23"), ts=5002))
+            self.assertEqual([a["msg"].split()[2] for a in s2.snapshot()["alerts"]], ["3c:22:fb:00:00:01"])
+            s2.known.save(force=True)
+            self.assertEqual(len(KnownDevices(path).first_seen), 3)
+
+    def test_corrupt_device_list_is_ignored(self):
+        from pktan.stats import KnownDevices
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "known.json")
+            open(path, "w").write("{not json")
+            with redirect_stderr(io.StringIO()):
+                k = KnownDevices(path)
+            self.assertFalse(k.loaded)
     def test_plaintext_alert_only_when_accepted(self):
         s = Stats()
         cli, srv = "192.168.1.23", "192.168.1.50"

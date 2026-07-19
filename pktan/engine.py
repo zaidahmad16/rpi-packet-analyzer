@@ -16,12 +16,12 @@ class Engine:
                  write: str | None = None, max_mb: float = 50, count: int = 0,
                  realtime: bool = False, promisc: bool = True,
                  on_packet: Callable[[Packet], None] | None = None,
-                 notifier=None, archiver=None):
+                 notifier=None, archiver=None, known=None):
         self.iface, self.read, self.flt = iface, read, flt
         self.count, self.realtime, self.promisc = count, realtime, promisc
         self.on_packet = on_packet
         self.notifier, self.archiver = notifier, archiver
-        self.stats = Stats(on_alert=notifier.notify if notifier else None)
+        self.stats = Stats(on_alert=notifier.notify if notifier else None, known=known)
         self.writer = PcapWriter(write, int(max_mb * 1024 * 1024),
                                  on_rotate=archiver.rotated if archiver else None) if write else None
         self.error: BaseException | None = None
@@ -63,6 +63,8 @@ class Engine:
         except BaseException as e:   # surfaced to the main thread
             self.error = e
         finally:
+            with self.stats.lock:
+                self.stats.known.save(force=True)
             if self.writer:
                 if self.archiver:
                     # upload the last file here, synchronously, before exiting
