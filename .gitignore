@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.pcap
 *.pcap.1
+csrc/pktcap
+csrc/pktcap-asan

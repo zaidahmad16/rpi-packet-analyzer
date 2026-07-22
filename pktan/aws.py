@@ -112,10 +112,39 @@ def sign(method: str, host: str, path: str, query: dict[str, str] | None, header
     return hdrs
 
 
+# Local TCP ports of pktan's own AWS connections, so the capture never records
+# its own uploads. Without this, uploading a 50 MB capture produced 50 MB of
+# captured upload traffic, which filled the next file, which was uploaded...
+_own_ports: dict[int, float] = {}          # port -> time it stops counting
+_own_lock = threading.Lock()
+OWN_PORT_GRACE = 60.0                      # trailing ACKs/FINs after close
+
+
+def _track_port(port: int, until: float) -> None:
+    with _own_lock:
+        _own_ports[port] = until
+        now = time.time()
+        for p in [p for p, t in _own_ports.items() if t < now]:
+            del _own_ports[p]
+
+
+def is_own_traffic(sport: int | None, dport: int | None) -> bool:
+    """True for packets of a connection pktan itself opened to AWS."""
+    if not _own_ports:
+        return False
+    now = time.time()
+    with _own_lock:
+        return any(p is not None and _own_ports.get(p, 0) >= now for p in (sport, dport))
+
+
 def _request(method: str, host: str, path: str, headers: dict[str, str],
              body: bytes | BinaryIO | None, timeout: float = 30) -> bytes:
     conn = http.client.HTTPSConnection(host, timeout=timeout)
+    port = None
     try:
+        conn.connect()
+        port = conn.sock.getsockname()[1]
+        _track_port(port, float("inf"))        # counts as ours for the whole upload
         conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
         data = resp.read()
@@ -123,6 +152,8 @@ def _request(method: str, host: str, path: str, headers: dict[str, str],
         raise AwsError(f"{host}: {e}") from None
     finally:
         conn.close()
+        if port is not None:
+            _track_port(port, time.time() + OWN_PORT_GRACE)
     if resp.status >= 300:
         raise AwsError(f"{host} {method} {path}: HTTP {resp.status}: {_error_message(data)}")
     return data

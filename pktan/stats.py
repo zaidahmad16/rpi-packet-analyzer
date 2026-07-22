@@ -5,6 +5,7 @@ no matter how long the analyzer runs.
 """
 from __future__ import annotations
 
+import functools
 import ipaddress
 import json
 import os
@@ -117,6 +118,7 @@ def vendor_of(mac: str | None) -> str:
     return ""
 
 
+@functools.lru_cache(maxsize=16384)        # called per packet; addresses repeat constantly
 def is_local_ip(ip: str | None) -> bool:
     if not ip:
         return False
@@ -130,6 +132,7 @@ def is_local_ip(ip: str | None) -> bool:
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")   # tailscale lives here
 
 
+@functools.lru_cache(maxsize=16384)
 def _is_unicast_ip(ip: str | None) -> bool:
     if not ip:
         return False
@@ -195,7 +198,8 @@ class KnownDevices:
 class Stats:
     def __init__(self, recent: int = 300, dns_log: int = 300, alerts: int = 200,
                  on_alert: Callable[[dict], None] | None = None,
-                 known: KnownDevices | None = None):
+                 known: KnownDevices | None = None,
+                 feature_log=None, forest=None):
         self.lock = threading.Lock()
         self.on_alert = on_alert                  # called (under the lock) for every alert
         self.started = time.time()
@@ -221,9 +225,16 @@ class Stats:
         self._seq = 0
         self._first_ts: float | None = None
         self.known = known or KnownDevices()
+        self.engine_snapshot: dict | None = None    # latest top-K/drops from the C engine
+        # anomaly detection: per-device 60 s feature windows, logged and/or scored
+        from .features import WindowFeatures
+        self.feature_log, self.forest = feature_log, forest
+        self.windows = WindowFeatures(self._on_window) if (feature_log or forest) else None
+        self.anomaly: dict[str, dict] = {}         # mac -> latest score info
+        self._anomalous_streak: dict[str, int] = {}
 
     # ------------------------------------------------------------ ingest
-    def add(self, p: Packet) -> None:
+    def add(self, p: Packet, features: bool = True) -> None:
         with self.lock:
             if self._first_ts is None:
                 self._first_ts = p.ts
@@ -234,6 +245,8 @@ class Stats:
             self.proto_pkts[label] += 1
             self.proto_bytes[label] += p.length
             self._bucket(p.ts, p.length)
+            if self.windows and features:
+                self.windows.add(p)
             self.recent.append((self._seq, p.ts, p.iface, label, p.summary()))
 
             if p.proto in ("TCP", "UDP") and p.sport is not None:
@@ -353,6 +366,41 @@ class Stats:
                 del self.names[k]
         self.names[ip] = name
 
+    def _on_window(self, window: int, rows: list) -> None:
+        """Called (under the lock) when a 60 s window closes."""
+        if self.feature_log:
+            self.feature_log.write(window, rows)
+        if not self.forest:
+            return
+        seen = set()
+        for mac, ip, vec in rows:
+            score = self.forest.score(vec)
+            seen.add(mac)
+            self.anomaly[mac] = {"score": score, "ts": window, "ip": ip}
+            if score > self.forest.threshold:
+                streak = self._anomalous_streak.get(mac, 0) + 1
+                self._anomalous_streak[mac] = streak
+                if streak == 2:            # two windows in a row: not a one-off blip
+                    why = self.forest.explain(vec)
+                    who = f"{mac} ({vendor_of(mac) or 'unknown vendor'})" + (f" at {ip}" if ip else "")
+                    self._alert(window + 60, "warn", "anomaly",
+                                f"Unusual traffic from {who}: score {score:.2f} for 2 minutes"
+                                + (f" ({', '.join(why)})" if why else ""))
+            else:
+                self._anomalous_streak.pop(mac, None)
+        for mac in list(self._anomalous_streak):
+            if mac not in seen:            # went quiet: reset its streak
+                del self._anomalous_streak[mac]
+        if len(self.anomaly) > MAX_HOSTS:
+            for mac, _ in sorted(self.anomaly.items(), key=lambda kv: kv[1]["ts"])[: MAX_HOSTS // 10]:
+                del self.anomaly[mac]
+
+    def set_engine_snapshot(self, snap: dict) -> None:
+        """C engine callback: its own counters and its top-K sources by bytes."""
+        with self.lock:
+            self.engine_snapshot = snap
+            self.dropped = snap["kernel_drops"]
+
     # ------------------------------------------------------------ alerts
     def _detect(self, p: Packet) -> None:
         # ARP: an IP suddenly claimed by a different MAC (possible spoofing / IP conflict)
@@ -440,6 +488,7 @@ class Stats:
                 "recent": [{"seq": s, "ts": ts, "iface": i, "label": lb, "text": t}
                            for s, ts, i, lb, t in self.recent if s > since_seq][-100:],
                 "seq": self._seq,
+                "engine": self.engine_snapshot,
             }
 
 

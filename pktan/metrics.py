@@ -43,11 +43,19 @@ def render(stats: Stats, source: str) -> str:
             proto_bytes.append((_labels(protocol="other"), sum(stats.proto_bytes[k] for k, _ in rest)))
         lan_hosts = sum(1 for ip in stats.hosts if is_local_ip(ip))
         recent_devices = sum(1 for d in stats.devices.values() if now - d["last"] < 300)
-        alert_kinds = {"new-device", "arp-change", "port-scan", "plaintext"} | set(stats.alert_counts)
+        alert_kinds = {"new-device", "arp-change", "port-scan", "plaintext", "anomaly"} | set(stats.alert_counts)
         alerts = [(_labels(kind=k), stats.alert_counts.get(k, 0)) for k in sorted(alert_kinds)]
         packets, nbytes, dns = stats.packets, stats.bytes, stats.dns_queries
         devices, hosts, flows = len(stats.devices), len(stats.hosts), len(stats.flows)
         started = stats.started
+        snap = stats.engine_snapshot
+        dropped = stats.dropped
+        # scores from the last couple of windows only, most anomalous first, capped
+        recent = [(mac, a) for mac, a in stats.anomaly.items() if now - a["ts"] < 180]
+        recent.sort(key=lambda kv: -kv[1]["score"])
+        anomaly = [(_labels(device=mac), round(a["score"], 4)) for mac, a in recent[:50]]
+        has_model = stats.forest is not None
+        threshold = stats.forest.threshold if has_model else None
 
     metric("pktan_info", "gauge", "Build and capture source.",
            [(_labels(version=__version__, source=source), 1)])
@@ -65,4 +73,21 @@ def render(stats: Stats, source: str) -> str:
     metric("pktan_hosts", "gauge", "IP addresses currently tracked.", [("", hosts)])
     metric("pktan_hosts_lan", "gauge", "Tracked IP addresses that are on the LAN.", [("", lan_hosts)])
     metric("pktan_flows", "gauge", "Conversations currently tracked.", [("", flows)])
+    metric("pktan_kernel_drops_total", "counter",
+           "Packets the kernel dropped because capture fell behind.", [("", dropped)])
+    if has_model:
+        metric("pktan_anomaly_threshold", "gauge",
+               "Isolation Forest score above which a device-minute counts as unusual.",
+               [("", threshold)])
+        metric("pktan_anomaly_score", "gauge",
+               "Isolation Forest anomaly score per device for the last minute (0-1).", anomaly)
+    if snap is not None:
+        metric("pktan_engine_sources", "gauge",
+               "Source addresses in the C engine's hash table.", [("", snap["sources"])])
+        metric("pktan_source_bytes", "gauge",
+               "Bytes sent by each of the top-K sources (C engine min-heap).",
+               [(_labels(src=t["ip"]), t["bytes"]) for t in snap["top"]])
+        metric("pktan_source_packets", "gauge",
+               "Packets sent by each of the top-K sources (C engine min-heap).",
+               [(_labels(src=t["ip"]), t["packets"]) for t in snap["top"]])
     return "\n".join(out) + "\n"

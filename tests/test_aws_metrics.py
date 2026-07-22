@@ -114,6 +114,53 @@ class AwsRequestTests(unittest.TestCase):
         self.assertRegex(key, r"^pktan/[^/]+/2026/07/0\d/wlan0-2026070\dT\d{6}Z\.pcap$")
 
 
+class OwnTrafficTests(unittest.TestCase):
+    def test_own_upload_is_not_recaptured(self):
+        """Regression: archiving used to capture its own S3 uploads and loop forever."""
+        import socket
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from pktan.engine import Engine
+
+        class H(BaseHTTPRequestHandler):
+            def do_PUT(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200); self.end_headers()
+            def log_message(self, *a): pass
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.handle_request, daemon=True).start()
+        orig_conn = aws.http.client.HTTPSConnection
+        aws.http.client.HTTPSConnection = lambda host, timeout=30: orig_conn.__mro__[1]("127.0.0.1", srv.server_port, timeout=timeout)
+        try:
+            aws._request("PUT", "x", "/k", {"content-length": "5"}, b"hello")
+        finally:
+            aws.http.client.HTTPSConnection = orig_conn
+            srv.server_close()
+        own_port = max(aws._own_ports)
+        self.assertTrue(aws.is_own_traffic(own_port, 443))
+        self.assertTrue(aws.is_own_traffic(443, own_port))
+        self.assertFalse(aws.is_own_traffic(1, 2))
+
+        with tempfile.TemporaryDirectory() as d:
+            frames = [eth(MAC_PHONE, MAC_PI, 0x0800, ipv4("192.168.1.50", "3.5.89.64", 6, tcp(own_port, 443, "PA", b"x" * 900)))] * 20
+            frames += [eth(MAC_PHONE, MAC_PI, 0x0800, ipv4("192.168.1.50", "1.1.1.1", 6, tcp(50000, 443, "PA", b"y")))] * 3
+            src = os.path.join(d, "in.pcap")
+            w = PcapWriter(src)
+            for i, f in enumerate(frames):
+                w.write(time.time() + i * 0.01, f, len(f))
+            w.close()
+            out = os.path.join(d, "out.pcap")
+
+            class Quiet:
+                def notify(self, a): pass
+                def close(self): pass
+            e = Engine(read=src, write=out, notifier=Quiet(), engine="python").start()
+            e.join()
+            self.assertIsNone(e.error)
+            self.assertEqual(e.stats.packets, 23)                  # still counted
+            self.assertEqual(len(list(read_pcap(out))), 3)         # but not saved
+
+
 class NotifierTests(unittest.TestCase):
     def test_rate_limit_and_suppressed_note(self):
         sent = []

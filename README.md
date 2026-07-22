@@ -1,6 +1,6 @@
 # pktan: Raspberry Pi network packet analyzer
 
-A small network packet analyzer written in pure Python (standard library only), built to run on a Raspberry Pi. It captures traffic, decodes the common protocols, and shows you what's going on through a terminal UI or a live web dashboard.
+A small network packet analyzer for the Raspberry Pi: a C capture engine on raw sockets, a Python core with no third-party dependencies, and an Isolation Forest that learns what normal traffic looks like on your network. It captures traffic, decodes the common protocols, and shows you what's going on through a terminal UI or a live web dashboard.
 
 ```
 $ sudo python3 -m pktan sniff -f "dns or (tcp port 443 and not port 22)"
@@ -14,6 +14,8 @@ $ sudo python3 -m pktan sniff -f "dns or (tcp port 443 and not port 22)"
 ## Features
 
 - **Live capture** with a raw `AF_PACKET` socket. Works on Ethernet, Wi-Fi, VLAN-tagged and tunnel interfaces (Tailscale/WireGuard), or on `any`.
+- **C capture engine** (`csrc/pktcap.c`): a TPACKET_V3 memory-mapped ring, hand-written Ethernet/802.1Q/IPv4/IPv6/TCP/UDP parsing, a bounded open-addressing hash table of per-source traffic, and a min-heap for the top-K talkers. Python only fully decodes the packets that carry names or alerts. It produces the same output as the pure-Python engine, field for field, and the tests check that.
+- **Anomaly detection:** per-device traffic features every minute, an **Isolation Forest** trained with scikit-learn, and scoring in pure Python at runtime, so the always-on service never loads numpy or scikit-learn.
 - **Decoders:** Ethernet, 802.1Q, ARP, IPv4, IPv6 (with extension headers), TCP, UDP, ICMP/ICMPv6, DNS/mDNS/LLMNR, DHCP (including client hostnames), TLS SNI, HTTP Host, and QUIC detection.
 - **Statistics:** throughput over time, protocol mix, top hosts, top conversations, top ports, DNS lookups, and the devices on the LAN, each with vendor (from the MAC prefix) plus hostnames learned from DNS, mDNS, DHCP and SNI.
 - **Alerts:** new device joined (remembered across restarts, so a reboot doesn't re-announce every quiet device), an IP address claimed by a different MAC (ARP spoofing or IP conflict), port scans, and unencrypted Telnet/FTP.
@@ -22,7 +24,7 @@ $ sudo python3 -m pktan sniff -f "dns or (tcp port 443 and not port 22)"
 - **Bounded memory:** every table is pruned, so it can run for weeks on a Pi.
 - **Prometheus metrics** at `/metrics`, plus a ready-made **Grafana** dashboard, deployed to k3s next to pktan.
 - **AWS:** alerts go to your phone or email through **SNS**, and saved captures upload to **S3**. AWS requests are signed with a hand-written Signature Version 4, so there's still nothing to install.
-- **Tested:** 44 unit tests built from hand-made packets (and AWS's own SigV4 test vectors), so no capture privileges or AWS account are needed to run them.
+- **Tested:** 59 unit tests built from hand-made packets, AWS's own SigV4 test vectors, C/Python parity checks, and an AddressSanitizer fuzz run of the C engine. No capture privileges or AWS account are needed to run them.
 
 ## Quick start (on the Pi)
 
@@ -65,8 +67,12 @@ This copies the code to `/opt/pktan` and installs `systemd/pktan.service`. The s
 | `pktan top [--realtime]` | Full-screen terminal dashboard |
 | `pktan web [--port 8080] [--bind ADDR]` | Web dashboard (JSON at `/api/stats`, live stream at `/events`, Prometheus at `/metrics`) |
 | `pktan aws-check [--sns-topic ARN] [--s3-bucket NAME]` | Send a test alert and upload a test file to prove the AWS setup works |
+| `pktan bench FILE.pcap [--repeat N]` | Packets per second for the Python engine, the C engine, and C parsing alone, plus peak memory |
+| `pktan features FILE.pcap... --out F.csv` | Turn saved captures into per-device feature rows |
+| `pktan train [--state-dir DIR]` | Fit the Isolation Forest on logged features (needs `python3-sklearn`) |
+| `pktan evaluate [--attack NAME CSV MAC]` | Fixed thresholds vs the Isolation Forest on held-out data and attack captures |
 
-Shared options: `-i IFACE` (or `any`), `-r FILE.pcap`, `-f FILTER`, `-w FILE.pcap --max-mb 50`, `--no-promisc`, and the AWS options `--sns-topic ARN`, `--alerts-per-hour N`, `--s3-bucket NAME`, `--s3-prefix P`.
+Shared options: `--engine auto|c|python` (default `auto`: C when `csrc/pktcap` is built), `-i IFACE` (or `any`), `-r FILE.pcap`, `-f FILTER`, `-w FILE.pcap --max-mb 50`, `--no-promisc`, and the AWS options `--sns-topic ARN`, `--alerts-per-hour N`, `--s3-bucket NAME`, `--s3-prefix P`.
 
 `web` hides its own dashboard traffic automatically (`--include-self` turns that off).
 
@@ -110,6 +116,39 @@ Setup in the AWS console:
 
 Alerts are capped at 20 per hour (`--alerts-per-hour`); the next message says how many were held back. SNS and S3 calls run on background threads, so a slow or missing connection never stalls capture. Failed uploads are retried at the next rotation, with at most 3 files kept waiting. On a home network this stays within the AWS free tier.
 
+## The C engine
+
+```bash
+make -C csrc            # builds csrc/pktcap; pktan also builds it on first use if cc is there
+python3 -m pktan bench capture.pcap --repeat 100
+```
+
+`pktcap` reads packets from a TPACKET_V3 ring that the kernel fills in 1 MiB blocks, so there's no system call per packet. It parses Ethernet, 802.1Q, IPv4, IPv6, TCP and UDP itself and sends Python a fixed 76-byte summary per packet. The raw bytes only go along when Python has to look deeper: DNS, DHCP, ARP, TLS client hellos, HTTP requests, ICMP, or anything malformed. Per-source counters live in an 8,192-slot open-addressing table; when it's three-quarters full the least recently seen half is dropped, so a scan of a /16 can't grow it. Every second a size-K min-heap picks the top talkers, and they appear in `/metrics` as `pktan_source_bytes`.
+
+On a Raspberry Pi 5 with a real home-network capture replayed 100 times (133,900 packets):
+
+| | packets/s |
+|---|---|
+| Python engine (decode + stats) | 34,668 |
+| C engine end to end (pktcap + Python stats) | 52,157 |
+| C parsing alone (`pktcap -n`) | 3,780,082 |
+
+C parses about 109 times faster than Python. End to end the gain is 1.5x, because Python's per-packet bookkeeping (stats, flows, names) is now the slow part. Either way it's far beyond what a home network sends. The live service uses about 9 MB for `pktcap` and 39 MB for Python.
+
+## Anomaly detection
+
+Every minute pktan turns each active device's traffic into ten numbers: packets and bytes out, bytes in, average packet size, distinct destinations, distinct ports, SYNs sent, resets received, DNS queries and ARP requests. They're log-scaled and appended to `$STATE_DIRECTORY/features.csv`, which is capped at 20 MB.
+
+```bash
+sudo apt install python3-sklearn        # only training needs it
+cd /opt/pktan && sudo python3 -m pktan train --state-dir /var/lib/pktan
+sudo systemctl restart pktan            # the service loads iforest.json on start
+```
+
+`train` fits scikit-learn's `IsolationForest` on the earliest 70% of rows, in time order. The alert threshold is the higher of 0.5 and the score that only 0.5% of training rows exceed. The trees are exported to `iforest.json`, and the service scores each device-minute in pure Python; a test checks the scores match scikit-learn's to 1e-9. A device has to score above the threshold for two minutes in a row before it raises an `anomaly` alert, which goes through SNS like the others. The alert names the features that are furthest from normal. Scores appear in `/metrics` as `pktan_anomaly_score` and on the Grafana dashboard.
+
+`pktan evaluate` compares this with a typical fixed-threshold detector (static limits on packets, bytes, destinations, ports, SYNs, resets and DNS queries per minute) on the held-out rows and on recorded attacks.
+
 ## What the Pi can actually see
 
 A packet analyzer only sees traffic that physically reaches its network card:
@@ -135,6 +174,10 @@ pktan/
   web.py       HTTP server, JSON API, Server-Sent Events, /metrics
   metrics.py   Prometheus text exposition
   aws.py       SigV4 signing, SNS alerts, S3 capture archiving
+  cengine.py   runs csrc/pktcap and turns its records into Packets
+  features.py  per-device feature windows and the capped CSV log
+  iforest.py   Isolation Forest training (sklearn), export, pure-Python scoring, evaluation
+csrc/          pktcap.c, the C capture engine, and its Makefile (make asan for a sanitizer build)
   static/index.html  dashboard (vanilla JS, no CDN, works offline)
 deploy/k8s/    Prometheus + Grafana manifests and install script for k3s
 deploy/grafana/  the provisioned dashboard
@@ -147,4 +190,5 @@ tests/         python3 -m unittest discover -s tests
 - Linux only (raw sockets use `AF_PACKET`). On other systems, `--read` still works.
 - Reads classic `.pcap`, not `.pcapng`. Convert with `editcap -F pcap in.pcapng out.pcap`.
 - No TCP stream reassembly: SNI and HTTP Host come from the first segment, which covers almost all real traffic.
+- The anomaly model is only as good as the "normal" it was trained on. A model trained on a few hours hasn't seen nights, weekends or updates; retrain after a few days of logging.
 - The filter is applied in Python, after capture. At several hundred Mbit/s on a Pi, expect drops. It's built for home and lab networks.

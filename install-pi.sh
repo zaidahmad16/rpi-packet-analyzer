@@ -14,15 +14,15 @@ SERVICE="${2:-}"
 cd "$(dirname "$0")"
 
 echo "==> copying to $HOST:~/pktan"
-tar --exclude='__pycache__' --exclude='*.pcap*' -czf - pktan tests systemd README.md \
+tar --exclude='__pycache__' --exclude='*.pcap*' --exclude='csrc/pktcap' --exclude='csrc/pktcap-asan' -czf - pktan csrc tests systemd deploy README.md \
   | ssh "$HOST" 'rm -rf ~/pktan && mkdir -p ~/pktan && tar -xzf - -C ~/pktan'
 
 echo "==> running tests on $HOST"
-ssh "$HOST" 'cd ~/pktan && python3 -m unittest discover -s tests 2>&1 | tail -1'
+ssh "$HOST" 'cd ~/pktan && make -s -C csrc && python3 -m unittest discover -s tests 2>&1 | tail -1'
 
 if [[ "$SERVICE" == "--service" ]]; then
   echo "==> installing systemd service (needs sudo on $HOST)"
-  ssh -t "$HOST" 'sudo rm -rf /opt/pktan && sudo cp -r ~/pktan /opt/pktan &&
+  ssh -t "$HOST" 'sudo rm -rf /opt/pktan && sudo cp -r ~/pktan /opt/pktan && sudo make -s -C /opt/pktan/csrc &&
     sudo cp /opt/pktan/systemd/pktan.service /etc/systemd/system/ &&
     sudo systemctl daemon-reload && sudo systemctl enable --now pktan &&
     sleep 2 && systemctl --no-pager status pktan | head -5'
