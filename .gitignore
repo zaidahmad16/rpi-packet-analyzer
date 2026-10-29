@@ -4,3 +4,4 @@ __pycache__/
 *.pcap.1
 csrc/pktcap
 csrc/pktcap-asan
+.vscode/
