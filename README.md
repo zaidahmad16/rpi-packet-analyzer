@@ -8,7 +8,7 @@ A packet analyzer that lives on my Raspberry Pi 5. A C engine reads traffic stra
 
 *The browser dashboard after two minutes on my home Wi-Fi. Addresses in all screenshots are scrubbed.*
 
-I built it over the summer of 2026. I wanted to know what the devices in my house were saying to each other, and I wanted to understand it down to the byte instead of letting Wireshark do the interesting part.
+I wanted to know what the devices in my house were saying to each other, and I wanted to understand it down to the byte instead of letting Wireshark do the interesting part.
 
 ## Results
 
